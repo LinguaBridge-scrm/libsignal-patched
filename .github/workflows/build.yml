@@ -168,7 +168,9 @@ jobs:
             echo
             cat natives/build-info-*.txt
           } > dist/BUILD-INFO.txt
-          (cd dist && find . -type f | sed 's|^\./||' | sort | xargs sha256sum > SHA256SUMS)
+          # 先算完再写，SHA256SUMS 不会把自己算进去
+          sums=$(cd dist && find . -type f | sed 's|^\./||' | sort | xargs sha256sum)
+          echo "$sums" > dist/SHA256SUMS
           {
             echo '```'
             cat dist/BUILD-INFO.txt
