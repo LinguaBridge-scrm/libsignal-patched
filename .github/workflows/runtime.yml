@@ -1,0 +1,246 @@
+# Signal 运行时包：给 NexaChat 客户端用的 signal-cli + jlink 裁剪的 Temurin JRE + 补丁版 libsignal 原生库，
+# 为 win32-x64、darwin-arm64 各出一个 signal-runtime-<版本>-<target>.tar.gz（包内布局见 scripts/assemble_runtime.py）。
+# 原生库和补丁版 jar 取自 build.yml 某次成功运行的构件（输入 natives_run；留空 = main 上最近一次成功的运行，
+# 构件保留 90 天，过期了先重跑 build.yml），并核对那次运行用的补丁与本提交的 patches/ 相同。
+# 组装后在对应系统的机器上实测（scripts/test_runtime.py）：Mach-O 只有 arm64、Windows 原生库依赖的 VC 运行库在 jre/bin、
+# signal-cli --version、libsignal 只从 java.library.path 加载 native/ 里的文件、sqlite-jdbc、多账号 jsonRpc 下 startLink 拿到
+# sgnl:// 链接（不扫码）。
+# 勾选 release 时把两个 tar.gz 和 SHA256SUMS 发到 Release signal-runtime-<版本>；同名 Release 已存在就失败，发过的包不覆盖。
+# 换 signal-cli、libsignal、JRE 或原生库时先改 RUNTIME_VERSION（<signal-cli 版本>-<序号>）。
+name: Signal runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      natives_run:
+        description: 取原生库的 build.yml 运行 ID（留空 = main 上最近一次成功的运行）
+        required: false
+        default: ''
+      release:
+        description: 发布 Release signal-runtime-<版本>
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - scripts/assemble_runtime.py
+      - scripts/test_runtime.py
+      - scripts/Smoke.java
+      - scripts/SqliteSmoke.java
+      - .github/workflows/runtime.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUNTIME_VERSION: 0.14.9-1
+  SIGNAL_CLI_VERSION: 0.14.9
+  SIGNAL_CLI_SHA256: c32b87f587198cbd277c9d71228716ee6047ee2b63e8e88728e8280d9407d65a
+  SIGNAL_CLI_COMMIT: 3997429779095ff3a2d64c877126e84fce9852aa
+  LIBSIGNAL_VERSION: 0.103.0
+  LIBSIGNAL_COMMIT: ba133bd3457f556fbf56db0a5ab985de0af79da6
+  PATCH_FILE: patches/libsignal-v0.103.0.patch
+  JDK_SOURCE_URL: https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk-sources_25.0.4.1_1.tar.gz
+  # 许可证：signal-cli、libsignal 的 LICENSE 和 libsignal-jni 的 Rust 依赖致谢，取自上面两个提交
+  SIGNAL_CLI_LICENSE_SHA256: 8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903
+  LIBSIGNAL_LICENSE_SHA256: 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0
+  LIBSIGNAL_ACK_SHA256: c91e04890a8b92ae598e6cee20dbed2815c0a3a61d59a31a27f071879c7d8911
+
+jobs:
+  natives:
+    name: 原生库来源
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run_id: ${{ steps.run.outputs.run_id }}
+      run_url: ${{ steps.run.outputs.run_url }}
+      patch_commit: ${{ steps.run.outputs.patch_commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 确定 build.yml 的运行并核对补丁
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVES_RUN: ${{ inputs.natives_run }}
+        run: |
+          id="$NATIVES_RUN"
+          if [ -z "$id" ]; then
+            id=$(gh run list -R "$GITHUB_REPOSITORY" -w build.yml -b main -s success -L 1 --json databaseId --jq '.[0].databaseId')
+            [ -n "$id" ] || { echo "::error::main 上没有成功的 build.yml 运行，先运行 build.yml"; exit 1; }
+          fi
+          info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq '[.path, .conclusion, .head_sha, .html_url] | @tsv')
+          IFS=$'\t' read -r path conclusion sha url <<< "$info"
+          if [ "$path" != ".github/workflows/build.yml" ] || [ "$conclusion" != "success" ]; then
+            echo "::error::运行 $id 不是成功的 build.yml（$path，$conclusion）"
+            exit 1
+          fi
+          gh run download "$id" -R "$GITHUB_REPOSITORY" -n "libsignal-client-$LIBSIGNAL_VERSION-patched" -D built
+          want="patch sha256: $(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+          grep -qxF "$want" built/BUILD-INFO.txt || { echo "::error::运行 $id 用的补丁与本提交的 $PATCH_FILE 不同"; cat built/BUILD-INFO.txt; exit 1; }
+          grep -q "^libsignal v$LIBSIGNAL_VERSION ($LIBSIGNAL_COMMIT)" built/BUILD-INFO.txt || { echo "::error::运行 $id 编的不是 libsignal $LIBSIGNAL_COMMIT"; exit 1; }
+          # 早期运行的 SHA256SUMS 里多了一行它自己（必然对不上），跳过这一行
+          (cd built && grep -v ' SHA256SUMS$' SHA256SUMS | sha256sum -c -)
+          { echo "run_id=$id"; echo "run_url=$url"; echo "patch_commit=$sha"; } >> "$GITHUB_OUTPUT"
+          echo "原生库取自 $url（提交 $sha）" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  assemble:
+    name: ${{ matrix.target }}
+    needs: natives
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win32-x64
+            os: windows-2025
+            platform: windows-x64
+            native: signal_jni_amd64.dll
+            jdk_url: https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk_x64_windows_hotspot_25.0.4.1_1.zip
+            jdk_sha256: 00c847d804f4a78e9f04f2683faf14fed898535b177b7fc704486cb0284e9283
+            jdk_home: jdk-25.0.4.1+1
+          - target: darwin-arm64
+            os: macos-15
+            platform: macos-arm64
+            native: libsignal_jni_aarch64.dylib
+            jdk_url: https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk_aarch64_mac_hotspot_25.0.4.1_1.tar.gz
+            jdk_sha256: 61979887f7506a24a57439ff99adb8b3a7fc89977d9cfe3b8984f58a981b7b9d
+            jdk_home: jdk-25.0.4.1+1/Contents/Home
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: 取输入（JDK、signal-cli、原生库、许可证）并校验
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.natives.outputs.run_id }}
+        run: |
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+          fetch() { # url 文件 sha256
+            curl -fsSL --retry 3 -o "$2" "$1"
+            [ "$(sha "$2")" = "$3" ] || { echo "::error::$2 校验值不对：$(sha "$2")"; exit 1; }
+          }
+          mkdir -p in/jdk in/licenses
+          jdk="in/$(basename "${{ matrix.jdk_url }}")"
+          fetch "${{ matrix.jdk_url }}" "$jdk" "${{ matrix.jdk_sha256 }}"
+          case "$jdk" in
+            *.zip) python -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$jdk" in/jdk ;;
+            *) tar -xzf "$jdk" -C in/jdk ;;
+          esac
+          "in/jdk/${{ matrix.jdk_home }}/bin/java" -version
+          fetch "https://github.com/AsamK/signal-cli/releases/download/v$SIGNAL_CLI_VERSION/signal-cli-$SIGNAL_CLI_VERSION.tar.gz" \
+            "in/signal-cli-$SIGNAL_CLI_VERSION.tar.gz" "$SIGNAL_CLI_SHA256"
+          fetch "https://raw.githubusercontent.com/AsamK/signal-cli/$SIGNAL_CLI_COMMIT/LICENSE" in/licenses/signal-cli-LICENSE "$SIGNAL_CLI_LICENSE_SHA256"
+          fetch "https://raw.githubusercontent.com/signalapp/libsignal/$LIBSIGNAL_COMMIT/LICENSE" in/licenses/libsignal-LICENSE "$LIBSIGNAL_LICENSE_SHA256"
+          fetch "https://raw.githubusercontent.com/signalapp/libsignal/$LIBSIGNAL_COMMIT/acknowledgments/acknowledgments-android.md" \
+            in/licenses/libsignal-acknowledgments.md "$LIBSIGNAL_ACK_SHA256"
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "native-${{ matrix.platform }}" -n "libsignal-client-$LIBSIGNAL_VERSION-patched" -D in/natives
+          ls -lR in/natives
+
+      - name: 组装
+        env:
+          PATCH_COMMIT: ${{ needs.natives.outputs.patch_commit }}
+          RUN_URL: ${{ needs.natives.outputs.run_url }}
+        run: |
+          case "$RUNTIME_VERSION" in "$SIGNAL_CLI_VERSION"-*) ;; *) echo "::error::RUNTIME_VERSION 应以 $SIGNAL_CLI_VERSION- 开头"; exit 1 ;; esac
+          TARBALL="signal-runtime-$RUNTIME_VERSION-${{ matrix.target }}.tar.gz"
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          python scripts/assemble_runtime.py --target "${{ matrix.target }}" --version "$RUNTIME_VERSION" \
+            --out out/signal-runtime --tar "out/$TARBALL" \
+            --jdk "in/jdk/${{ matrix.jdk_home }}" --jdk-url "${{ matrix.jdk_url }}" --jdk-sha256 "${{ matrix.jdk_sha256 }}" \
+            --jdk-source-url "$JDK_SOURCE_URL" \
+            --signal-cli "in/signal-cli-$SIGNAL_CLI_VERSION.tar.gz" --signal-cli-commit "$SIGNAL_CLI_COMMIT" \
+            --patched-jar "in/natives/libsignal-client-$LIBSIGNAL_VERSION-patched/${{ matrix.platform }}/libsignal-client-$LIBSIGNAL_VERSION.jar" \
+            --native "in/natives/native-${{ matrix.platform }}/${{ matrix.native }}" \
+            --patch "$PATCH_FILE" --patch-path "$PATCH_FILE" --patch-commit "$PATCH_COMMIT" --natives-run "$RUN_URL" \
+            --libsignal-version "$LIBSIGNAL_VERSION" --libsignal-commit "$LIBSIGNAL_COMMIT" \
+            --license-dir in/licenses \
+            --built-by "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (commit $GITHUB_SHA)"
+
+      - name: 实测
+        run: |
+          "in/jdk/${{ matrix.jdk_home }}/bin/javac" -cp "out/signal-runtime/lib/*" -d out/classes scripts/Smoke.java scripts/SqliteSmoke.java
+          python scripts/test_runtime.py out/signal-runtime --classes out/classes
+
+      - name: 摘要
+        run: |
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+          TARBALL="signal-runtime-$RUNTIME_VERSION-${{ matrix.target }}.tar.gz"
+          {
+            echo "### $TARBALL"
+            echo
+            echo "- SHA-256: \`$(sha "out/$TARBALL")\`"
+            echo "- 大小: $(wc -c < "out/$TARBALL" | tr -d ' ') 字节"
+            echo "- VERSION.json: \`$(tr -d '\n ' < out/signal-runtime/VERSION.json)\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: signal-runtime-${{ matrix.target }}
+          path: out/signal-runtime-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: 发布
+    needs: [natives, assemble]
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: signal-runtime-*
+          path: dist
+          merge-multiple: true
+
+      - name: SHA256SUMS 与 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ needs.natives.outputs.run_url }}
+        run: |
+          tag="signal-runtime-$RUNTIME_VERSION"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $tag 已存在；发过的包不覆盖，换包请先改 RUNTIME_VERSION"
+            exit 1
+          fi
+          cd dist
+          ls -l
+          for t in win32-x64 darwin-arm64; do
+            [ -f "$tag-$t.tar.gz" ] || { echo "::error::缺少 $tag-$t.tar.gz"; exit 1; }
+          done
+          sha256sum "$tag"-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo "NexaChat 客户端用的 Signal 运行时：signal-cli $SIGNAL_CLI_VERSION + Eclipse Temurin 25.0.4.1+1（jlink 裁剪）+ 补丁版 libsignal $LIBSIGNAL_VERSION 原生库。"
+            echo
+            echo "- 原生库：$RUN_URL"
+            echo "- 组装与实测：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID（提交 $GITHUB_SHA）"
+            echo "- 各组件的版本、源码地址和许可证见包内 licenses/SOURCES.md。"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Signal runtime $RUNTIME_VERSION" \
+            --notes-file notes.md "$tag"-*.tar.gz SHA256SUMS

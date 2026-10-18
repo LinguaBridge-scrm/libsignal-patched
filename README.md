@@ -25,6 +25,30 @@ Patched libsignal v0.103.0 JNI libraries for signal-cli 0.14.9: a configured pro
 - 原版 jar 里的 macOS x86_64 原生库没有补丁版，已删掉：在 Intel Mac 上会加载失败，而不是悄悄用回原版。
 - 工作流最后在三个平台上各用替换后的 jar 跑一次冒烟测试（[scripts/Smoke.java](scripts/Smoke.java)：从 jar 里加载原生库并生成一对身份密钥）。
 
+## Signal 运行时包（NexaChat 客户端用）
+
+[runtime 工作流](.github/workflows/runtime.yml)把 signal-cli、jlink 裁剪的 Eclipse Temurin JRE 和上面的补丁版原生库组装成
+`signal-runtime-<版本>-<target>.tar.gz`（target 为 `win32-x64`、`darwin-arm64`），手动运行时勾选 release 会连同 `SHA256SUMS`
+发到 Release `signal-runtime-<版本>`。原生库取自 build 工作流某次成功运行的构件（默认 main 上最近一次），并核对补丁一致。
+
+包内布局（[scripts/assemble_runtime.py](scripts/assemble_runtime.py)，NexaChat 按它找文件）：
+
+| 路径 | 内容 |
+|---|---|
+| `VERSION.json` | `{signalCli, libsignal, patchCommit, jre, target}` |
+| `jre/` | jlink 裁剪的 Temurin 25（模块和参数见脚本里的 `MODULES`、`JLINK_FLAGS`） |
+| `lib/` | signal-cli 发行包的全部 jar；libsignal-client 换成补丁版并删掉 jar 里的原生库，sqlite-jdbc 只留本平台的原生库 |
+| `native/` | 本平台的补丁版原生库：`signal_jni.dll` / `libsignal_jni.dylib` |
+| `classpath.txt` | signal-cli 自带 `bin/signal-cli` 里 CLASSPATH 的顺序，一行一个 jar 文件名 |
+| `licenses/` | signal-cli（GPLv3）、libsignal（AGPLv3，含 Rust 依赖致谢）、Temurin（GPLv2 + Classpath Exception）的许可证和 `SOURCES.md` |
+
+启动方式：`jre/bin/java --enable-native-access=ALL-UNNAMED -Djava.library.path=native -cp <classpath.txt 里的 jar> org.asamk.signal.Main …`。
+jar 里没有原生库，libsignal 只会从 `java.library.path` 加载 `native/` 里的文件。工作流在 Windows、macOS 机器上各实测一次
+（[scripts/test_runtime.py](scripts/test_runtime.py)）：`--version`、不给 `java.library.path` 时加载失败而给了能加载、sqlite-jdbc、
+多账号 `jsonRpc` 下 `startLink` 拿到 `sgnl://linkdevice` 链接。
+
+换 signal-cli、libsignal、JRE 或原生库时，先改工作流里的 `RUNTIME_VERSION`（`<signal-cli 版本>-<序号>`），已发的 Release 不覆盖。
+
 ## 本机编译（macOS Apple Silicon）
 
 ```bash
