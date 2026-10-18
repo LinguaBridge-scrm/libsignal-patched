@@ -14,7 +14,8 @@ on:
     branches: [main]
     paths:
       - patches/**
-      - scripts/**
+      - scripts/repack_jar.py
+      - scripts/Smoke.java
       - .github/workflows/build.yml
 
 permissions:

@@ -36,7 +36,7 @@ def fail(msg):
 
 
 def run(cmd, timeout=120, **kw):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **kw)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -120,7 +120,10 @@ def main():
     p.add_argument("--classes", required=True)
     p.add_argument("--no-link", action="store_true")
     a = p.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # Windows 机器的控制台默认不是 UTF-8
+        stream.reconfigure(encoding="utf-8", errors="replace")
     root = os.path.realpath(a.root)
+    classes = os.path.realpath(a.classes)  # 下面有的命令换了工作目录，类路径必须是绝对路径
     with open(os.path.join(root, "VERSION.json"), encoding="utf-8") as f:
         version = json.load(f)
     target = version["target"]
@@ -150,7 +153,7 @@ def main():
         fail(f"signal-cli --version（exit {code}）: {out}{err}")
 
     # 2. libsignal 只能从 java.library.path 加载
-    smoke_cp = os.pathsep.join([a.classes, cp])
+    smoke_cp = os.pathsep.join([classes, cp])
     code, out, err = run([*base, "-cp", smoke_cp, "Smoke"])
     if code == 0 or "signal_jni" not in out + err:
         fail(f"不给 java.library.path 时 libsignal 不应能加载（exit {code}）: {out}{err}")
@@ -186,7 +189,7 @@ def start_link(base, lib_path, cp, data_dir):
     cmd = [*base, lib_path, "-cp", cp, "org.asamk.signal.Main", "--data-dir", data_dir, "jsonRpc"]
     started = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            encoding="utf-8")
+                            encoding="utf-8", errors="replace")
     lines = queue.Queue()
     stderr = []
     threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout], daemon=True).start()

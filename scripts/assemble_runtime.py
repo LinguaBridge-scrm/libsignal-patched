@@ -271,6 +271,8 @@ def main():
     p.add_argument("--patch-path", default="patches/libsignal-v0.103.0.patch", help="补丁在本仓库里的路径（写进 SOURCES.md）")
     p.add_argument("--built-by", default="", help="组装这次运行时的工作流地址（写进 SOURCES.md）")
     a = p.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # Windows 机器的控制台默认不是 UTF-8
+        stream.reconfigure(encoding="utf-8", errors="replace")
     if a.target not in TARGETS:
         die(f"--target 只能是 {', '.join(TARGETS)}")
     t = TARGETS[a.target]
