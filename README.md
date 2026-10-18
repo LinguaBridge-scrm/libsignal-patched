@@ -35,16 +35,17 @@ Patched libsignal v0.103.0 JNI libraries for signal-cli 0.14.9: a configured pro
 
 | 路径 | 内容 |
 |---|---|
-| `VERSION.json` | `{signalCli, libsignal, patchCommit, jre, target}` |
+| `VERSION.json` | `{signalCli, libsignal, patchCommit, jre, target, jvmArgs}`；`jvmArgs` 是要追加在 `-cp` 之前的 JVM 参数，`${native}`、`${root}` 换成 `native/` 与包根目录的绝对路径 |
 | `jre/` | jlink 裁剪的 Temurin 25（模块和参数见脚本里的 `MODULES`、`JLINK_FLAGS`） |
-| `lib/` | signal-cli 发行包的全部 jar；libsignal-client 换成补丁版并删掉 jar 里的原生库，sqlite-jdbc 只留本平台的原生库 |
-| `native/` | 本平台的补丁版原生库：`signal_jni.dll` / `libsignal_jni.dylib` |
+| `lib/` | signal-cli 发行包的全部 jar；libsignal-client 换成补丁版。jar 里不含任何原生库（libsignal-client、sqlite-jdbc 的都已删掉） |
+| `native/` | 本平台的原生库，随应用签名：补丁版 libsignal（`signal_jni.dll` / `libsignal_jni.dylib`）和 sqlite-jdbc 自带的那份（`sqlitejdbc.dll` / `libsqlitejdbc.dylib`） |
 | `classpath.txt` | signal-cli 自带 `bin/signal-cli` 里 CLASSPATH 的顺序，一行一个 jar 文件名 |
-| `licenses/` | signal-cli（GPLv3）、libsignal（AGPLv3，含 Rust 依赖致谢）、Temurin（GPLv2 + Classpath Exception）的许可证和 `SOURCES.md` |
+| `licenses/` | signal-cli（GPLv3）、libsignal（AGPLv3，含 Rust 依赖致谢）、sqlite-jdbc（Apache-2.0）、Temurin（GPLv2 + Classpath Exception）的许可证和 `SOURCES.md` |
 
-启动方式：`jre/bin/java --enable-native-access=ALL-UNNAMED -Djava.library.path=native -cp <classpath.txt 里的 jar> org.asamk.signal.Main …`。
-jar 里没有原生库，libsignal 只会从 `java.library.path` 加载 `native/` 里的文件。工作流在 Windows、macOS 机器上各实测一次
-（[scripts/test_runtime.py](scripts/test_runtime.py)）：`--version`、不给 `java.library.path` 时加载失败而给了能加载、sqlite-jdbc、
+启动方式：`jre/bin/java --enable-native-access=ALL-UNNAMED -Djava.library.path=native <jvmArgs> -cp <classpath.txt 里的 jar> org.asamk.signal.Main …`。
+jar 里没有原生库：libsignal 从 `java.library.path` 加载 `native/` 里的文件，sqlite-jdbc 按 `jvmArgs` 里的 `org.sqlite.lib.path`、
+`org.sqlite.lib.name` 加载 `native/` 里的那份，都不解压到临时目录，Mac 上随应用一起签名。工作流在 Windows、macOS 机器上各实测一次
+（[scripts/test_runtime.py](scripts/test_runtime.py)）：`--version`；不给参数时两个原生库都加载失败，按上面的方式启动就都从 `native/` 加载；
 多账号 `jsonRpc` 下 `startLink` 拿到 `sgnl://linkdevice` 链接。
 
 换 signal-cli、libsignal、JRE 或原生库时，先改工作流里的 `RUNTIME_VERSION`（`<signal-cli 版本>-<序号>`），已发的 Release 不覆盖。

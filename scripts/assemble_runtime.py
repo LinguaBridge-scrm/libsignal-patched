@@ -11,13 +11,16 @@
       --license-dir <目录：signal-cli-LICENSE、libsignal-LICENSE、libsignal-acknowledgments.md> [--built-by <地址>]
 
 包内布局（NexaChat 主机按它找文件，不要改）：
-  VERSION.json    {signalCli, libsignal, patchCommit, jre, target}
+  VERSION.json    {signalCli, libsignal, patchCommit, jre, target, jvmArgs}。jvmArgs 是主机追加在固定 JVM 参数之后、-cp 之前的
+                  额外参数，占位符 ${native}、${root} 由主机换成 native/ 与运行时根目录的绝对路径
   jre/            jlink 裁剪的 Temurin（符号链接一律换成文件副本）
-  lib/            signal-cli 发行包的全部 jar；libsignal-client 换成补丁版并删掉 jar 里所有原生库，
-                  sqlite-jdbc 只保留本平台的原生库
-  native/         本平台的补丁版 libsignal 原生库（signal_jni.dll / libsignal_jni.dylib），经 java.library.path 加载
+  lib/            signal-cli 发行包的全部 jar；libsignal-client 换成补丁版。libsignal-client 和 sqlite-jdbc 里的原生库全部删掉，
+                  lib/ 里不含任何原生代码（Mac 公证会检查 jar 里的 Mach-O）
+  native/         本平台的原生库，随应用一起签名：补丁版 libsignal（signal_jni.dll / libsignal_jni.dylib，经 java.library.path
+                  加载）和 sqlite-jdbc 自带的那份（sqlitejdbc.dll / libsqlitejdbc.dylib，经 jvmArgs 里的 org.sqlite.lib.path、
+                  org.sqlite.lib.name 加载，不再解压到临时目录）
   classpath.txt   signal-cli 自带 bin/signal-cli 里 CLASSPATH 的顺序，一行一个 jar 文件名
-  licenses/       signal-cli、libsignal、Temurin 的许可证和 SOURCES.md
+  licenses/       signal-cli、libsignal、sqlite-jdbc、Temurin 的许可证和 SOURCES.md
 
 tar.gz 可复现：条目按路径排序，时间戳取 SOURCE_DATE_EPOCH（缺省为 0），属主为 0，gzip 头不带文件名和时间。
 """
@@ -50,16 +53,24 @@ TARGETS = {
         "native": "signal_jni.dll",  # System.mapLibraryName("signal_jni")
         "built": "signal_jni_amd64.dll",  # 官方 jar 里的文件名（build_jni.sh）
         "sqlite": "org/sqlite/native/Windows/x86_64/",
+        "sqlite_native": "sqlitejdbc.dll",
         "java": "jre/bin/java.exe",
     },
     "darwin-arm64": {
         "native": "libsignal_jni.dylib",
         "built": "libsignal_jni_aarch64.dylib",
         "sqlite": "org/sqlite/native/Mac/aarch64/",
+        "sqlite_native": "libsqlitejdbc.dylib",
         "java": "jre/bin/java",
     },
 }
 TOP_LEVEL = ["VERSION.json", "classpath.txt", "jre", "lib", "licenses", "native"]
+NATIVE_EXTS = (".dll", ".dylib", ".so", ".jnilib")
+SQLITE_NATIVE_PREFIX = "org/sqlite/native/"
+SQLITE_LICENSES = {  # jar 里的许可证 → licenses/ 里的文件名
+    "META-INF/maven/org.xerial/sqlite-jdbc/LICENSE": "sqlite-jdbc-LICENSE.txt",
+    "META-INF/maven/org.xerial/sqlite-jdbc/LICENSE.zentus": "sqlite-jdbc-LICENSE.zentus.txt",
+}
 
 
 def die(msg):
@@ -169,8 +180,9 @@ def sources_md(a, info):
     lines = [
         f"# Signal runtime {a.version} ({a.target}): components and corresponding source",
         "",
-        "This package lets NexaChat run signal-cli as a local process. It bundles three components, each under its",
-        "own licence. The licence texts are in this folder; NexaChat itself is not covered by them.",
+        "This package lets NexaChat run signal-cli as a local process. It bundles signal-cli with its Java dependencies,",
+        "a patched libsignal and a reduced Eclipse Temurin JRE, each under its own licence. The licence texts are in this",
+        "folder; NexaChat itself is not covered by them.",
         "",
         f"Assembled by {a.built_by or 'a local run'} with scripts/assemble_runtime.py of",
         "https://github.com/LinguaBridge-scrm/libsignal-patched.",
@@ -178,6 +190,8 @@ def sources_md(a, info):
         "| Component | Exact version | Licence | Location in this package |",
         "|---|---|---|---|",
         f"| signal-cli | {info['signalCli']} | GPL-3.0 (`signal-cli-LICENSE.txt`) | `lib/`, `classpath.txt` |",
+        f"| sqlite-jdbc (a signal-cli dependency) | {info['sqliteVersion']} | Apache-2.0 (`sqlite-jdbc-LICENSE.txt`; "
+        f"`sqlite-jdbc-LICENSE.zentus.txt`; the bundled SQLite is public domain) | `lib/{info['sqliteJar']}`, `native/{t['sqlite_native']}` |",
         f"| libsignal, patched | {info['libsignal']} + network patch | AGPL-3.0-only (`libsignal-LICENSE.txt`; Rust dependencies: "
         f"`libsignal-acknowledgments.md`) | `native/{t['native']}`, `lib/libsignal-client-{info['libsignal']}.jar` |",
         f"| Eclipse Temurin JRE | {info['jre']} | GPL-2.0 with Classpath Exception (`temurin-LICENSE.txt`, "
@@ -192,7 +206,10 @@ def sources_md(a, info):
         "- signal-cli itself is unchanged. `lib/` holds every jar of that release, byte for byte, except:",
         f"  - `libsignal-client-{info['libsignal']}.jar`: the patched build below with all native libraries removed; "
         f"libsignal loads `native/{t['native']}` through `java.library.path` instead;",
-        f"  - `{info['sqliteJar']}`: native libraries of other platforms removed (only `{t['sqlite']}` is kept).",
+        f"  - `{info['sqliteJar']}`: all native libraries removed; the one for this platform (`{t['sqlite']}{t['sqlite_native']}`,",
+        f"    byte for byte, SHA-256 {info['sqliteNativeSha256']}) is `native/{t['sqlite_native']}`, loaded through",
+        "    `-Dorg.sqlite.lib.path` / `-Dorg.sqlite.lib.name` (the `jvmArgs` of `VERSION.json`) instead of a temporary copy.",
+        f"- sqlite-jdbc source: https://github.com/xerial/sqlite-jdbc/tree/{info['sqliteVersion']}.",
         "- The other jars are third-party libraries that signal-cli distributes under their own licences; see the",
         "  `META-INF` folder of each jar. `classpath.txt` lists the jars in the order of the release's `bin/signal-cli`.",
         "",
@@ -312,29 +329,41 @@ def main():
             dropped = rewrite_jar(patched, dst, lambda n: not is_native(n))
             print(f"[assemble] lib/{name}: 补丁版，删掉原生库 {', '.join(dropped)}")
         elif name == sqlite_jars[0]:
-            prefix = "org/sqlite/native/"
-            keep_dirs = {prefix + "/".join(t["sqlite"][len(prefix):].split("/")[:i]) + "/" for i in range(1, 3)}
-
-            def keep(n):
-                return not n.startswith(prefix) or n == prefix or n.startswith(t["sqlite"]) or n in keep_dirs
-
-            dropped = rewrite_jar(jars[name], dst, keep)
-            with zipfile.ZipFile(dst) as z:
-                kept = [i.filename for i in z.infolist() if i.filename.startswith(t["sqlite"]) and not i.filename.endswith("/")]
-            if not kept:
-                die(f"{name} 里没有 {t['sqlite']} 的原生库")
-            print(f"[assemble] lib/{name}: 只保留 {', '.join(kept)}（删掉 {sum(not n.endswith('/') for n in dropped)} 个其他平台的原生库）")
+            own = t["sqlite"] + t["sqlite_native"]
+            with zipfile.ZipFile(io.BytesIO(jars[name])) as z:
+                if own not in z.namelist():
+                    die(f"{name} 里没有 {own}")
+                sqlite_native = z.read(own)
+                sqlite_licenses = {dst_name: z.read(src) for src, dst_name in SQLITE_LICENSES.items() if src in z.namelist()}
+                sqlite_version = z.read("META-INF/maven/org.xerial/sqlite-jdbc/pom.properties").decode("utf-8")
+            if len(sqlite_licenses) != len(SQLITE_LICENSES):
+                die(f"{name} 里缺少许可证文件：{sorted(set(SQLITE_LICENSES.values()) - set(sqlite_licenses))}")
+            m = re.search(r"^version=(\S+)$", sqlite_version, re.M)
+            if not m:
+                die(f"{name} 的 pom.properties 里没有 version")
+            sqlite_version = m.group(1)
+            dropped = rewrite_jar(jars[name], dst, lambda n: not n.startswith(SQLITE_NATIVE_PREFIX))
+            print(f"[assemble] lib/{name}: 删掉 {sum(not n.endswith('/') for n in dropped)} 个原生库，"
+                  f"本平台的 {own} 放进 native/{t['sqlite_native']}")
         else:
             with open(dst, "wb") as f:
                 f.write(jars[name])
     with open(os.path.join(out, "classpath.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(order) + "\n")
+    for name in order:
+        with zipfile.ZipFile(os.path.join(lib_dir, name)) as z:
+            left = [i.filename for i in z.infolist() if i.filename.lower().endswith(NATIVE_EXTS)]
+        if left:
+            die(f"lib/{name} 里还有原生库：{', '.join(left[:5])}")
 
     # native/
     native_dir = os.path.join(out, "native")
     os.makedirs(native_dir)
     shutil.copyfile(a.native, os.path.join(native_dir, t["native"]))
-    os.chmod(os.path.join(native_dir, t["native"]), 0o755)
+    with open(os.path.join(native_dir, t["sqlite_native"]), "wb") as f:
+        f.write(sqlite_native)
+    for n in (t["native"], t["sqlite_native"]):
+        os.chmod(os.path.join(native_dir, n), 0o755)
 
     # jre/
     jre = os.path.join(out, "jre")
@@ -372,6 +401,9 @@ def main():
         if not os.path.isfile(src):
             die(f"缺少许可证文件：{src}")
         shutil.copyfile(src, os.path.join(lic, name))
+    for name, data in sqlite_licenses.items():
+        with open(os.path.join(lic, name), "wb") as f:
+            f.write(data)
     info = {
         "signalCli": signal_cli_version,
         "signalCliSha256": sha256_file(a.signal_cli),
@@ -379,6 +411,8 @@ def main():
         "patchSha256": sha256_file(a.patch),
         "nativeSha256": native_sha,
         "sqliteJar": sqlite_jars[0],
+        "sqliteVersion": sqlite_version,
+        "sqliteNativeSha256": hashlib.sha256(sqlite_native).hexdigest(),
         "jre": jre_version,
         "jreSourceRepo": jdk_release.get("SOURCE_REPO", "").removesuffix(".git") or "unknown",
         "jreSourceRev": jdk_release.get("SOURCE", "") or "unknown",
@@ -386,9 +420,10 @@ def main():
     with open(os.path.join(lic, "SOURCES.md"), "w", encoding="utf-8", newline="\n") as f:
         f.write(sources_md(a, info))
 
-    # VERSION.json（字段固定）
+    # VERSION.json（字段固定）；jvmArgs 里的 ${native} 由主机换成 native/ 的绝对路径
     version = {"signalCli": signal_cli_version, "libsignal": a.libsignal_version, "patchCommit": a.patch_commit,
-               "jre": jre_version, "target": a.target}
+               "jre": jre_version, "target": a.target,
+               "jvmArgs": ["-Dorg.sqlite.lib.path=${native}", f"-Dorg.sqlite.lib.name={t['sqlite_native']}"]}
     with open(os.path.join(out, "VERSION.json"), "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(version, indent=2) + "\n")
 

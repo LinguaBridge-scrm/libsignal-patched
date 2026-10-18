@@ -4,13 +4,15 @@
 
 用法：test_runtime.py <运行时目录> --classes <Smoke.class、SqliteSmoke.class 所在目录> [--no-link]
 
-先查二进制：macOS 包里的 Mach-O 全部只有 arm64，原生库只依赖系统库；Windows 原生库依赖的 VC 运行库都在 jre/bin
-（加载 native/ 里的 dll 时按 java.exe 所在目录找依赖，干净的 Windows 上也能加载）。
-然后全部用包里的 jre/bin/java、classpath.txt 的顺序和 -Djava.library.path=native，与 NexaChat 启动 signal-cli 的方式一致：
+先查二进制：macOS 包里的 Mach-O 全部只有 arm64，native/ 里的原生库只依赖系统库；Windows 原生库依赖的 VC 运行库都在
+jre/bin（加载 native/ 里的 dll 时按 java.exe 所在目录找依赖，干净的 Windows 上也能加载）。
+然后与 NexaChat 主机启动 signal-cli 的方式一致：包里的 jre/bin/java、-Djava.library.path=native、VERSION.json 的 jvmArgs
+（${native}、${root} 换成绝对路径）、classpath.txt 的顺序：
   1. org.asamk.signal.Main --version 输出 signal-cli <版本>；
   2. Smoke（libsignal 生成一对身份密钥）：不给 java.library.path 必须失败，证明 jar 里没有原生库、不会解压到临时目录；
-     给了必须成功，且 -Xlog:library 记下加载的正是 native/ 里那个文件；
-  3. SqliteSmoke：sqlite-jdbc 能加载本平台的原生库（其他平台的已从 jar 里删掉）；
+     按主机方式启动必须成功，且 -Xlog:library 记下加载的正是 native/ 里那个文件；
+  3. SqliteSmoke：不给 jvmArgs 和 java.library.path 必须失败（jar 里没有原生库）；按主机方式启动必须成功，加载的是
+     native/ 里那份，临时目录里什么也没解压；
   4. 多账号 jsonRpc（不带 -a）下 startLink 拿到 sgnl://linkdevice 链接（不扫码；要能连上 Signal 服务器）。
 """
 
@@ -28,6 +30,7 @@ import threading
 import time
 
 NATIVE = {"win32-x64": "signal_jni.dll", "darwin-arm64": "libsignal_jni.dylib"}
+SQLITE_NATIVE = {"win32-x64": "sqlitejdbc.dll", "darwin-arm64": "libsqlitejdbc.dylib"}
 JAVA = {"win32-x64": ["jre", "bin", "java.exe"], "darwin-arm64": ["jre", "bin", "java"]}
 
 
@@ -43,7 +46,7 @@ def run(cmd, timeout=120, **kw):
 MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
 
 
-def check_macos_binaries(root, native):
+def check_macos_binaries(root, natives):
     machos = []
     for dirpath, _, filenames in os.walk(root):
         for n in filenames:
@@ -58,14 +61,15 @@ def check_macos_binaries(root, native):
         if code != 0 or out.split() != ["arm64"]:
             fail(f"{os.path.relpath(path, root)} 的架构不是只有 arm64: {out.strip()}{err.strip()}")
     print(f"[test] {len(machos)} 个 Mach-O 都只有 arm64")
-    # otool -L 先列出 dylib 自己的安装名（编译机上的路径），要去掉
-    install_name = run(["otool", "-D", native])[1].splitlines()[1:]
-    code, out, err = run(["otool", "-L", native])
-    deps = [d for d in (l.strip().split(" (")[0] for l in out.splitlines()[1:] if l.strip()) if d not in install_name]
-    bad = [d for d in deps if not d.startswith(("/usr/lib/", "/System/Library/"))]
-    if code != 0 or bad:
-        fail(f"{native} 依赖了系统以外的库: {bad or err}")
-    print(f"[test] {os.path.basename(native)} 只依赖系统库: {', '.join(os.path.basename(d) for d in deps)}")
+    for native in natives:
+        # otool -L 先列出 dylib 自己的安装名（编译机上的路径），要去掉
+        install_name = run(["otool", "-D", native])[1].splitlines()[1:]
+        code, out, err = run(["otool", "-L", native])
+        deps = [d for d in (l.strip().split(" (")[0] for l in out.splitlines()[1:] if l.strip()) if d not in install_name]
+        bad = [d for d in deps if not d.startswith(("/usr/lib/", "/System/Library/"))]
+        if code != 0 or bad:
+            fail(f"{native} 依赖了系统以外的库: {bad or err}")
+        print(f"[test] {os.path.basename(native)} 只依赖系统库: {', '.join(os.path.basename(d) for d in deps)}")
 
 
 def pe_imports(path):
@@ -100,18 +104,24 @@ def pe_imports(path):
         pos += 20
 
 
-def check_windows_binaries(root, native):
-    imports = pe_imports(native)
-    print(f"[test] {os.path.basename(native)} 导入: {', '.join(imports)}")
-    bin_dir = os.path.join(root, "jre", "bin")
-    shipped = {n.lower() for n in os.listdir(bin_dir)}
-    vc = [n for n in imports if re.fullmatch(r"(msvcp|vcruntime|concrt)\d+(_\d+)?\.dll|ucrtbase\.dll", n.lower())]
-    if not vc:
-        fail(f"{native} 应依赖 VC 运行库（MSVCP140/VCRUNTIME140），导入表解析可能有误")
-    missing = [n for n in vc if n.lower() not in shipped]
-    if missing:
-        fail(f"jre/bin 里缺少原生库依赖的 VC 运行库: {missing}")
-    print(f"[test] VC 运行库都在 jre/bin: {', '.join(vc)}")
+def check_windows_binaries(root, natives, libsignal):
+    shipped = {n.lower() for n in os.listdir(os.path.join(root, "jre", "bin"))}
+    for native in natives:
+        imports = pe_imports(native)
+        print(f"[test] {os.path.basename(native)} 导入: {', '.join(imports)}")
+        vc = [n for n in imports if re.fullmatch(r"(msvcp|vcruntime|concrt)\d+(_\d+)?\.dll|ucrtbase\.dll", n.lower())]
+        if native == libsignal and not vc:
+            fail(f"{native} 应依赖 VC 运行库（MSVCP140/VCRUNTIME140），导入表解析可能有误")
+        missing = [n for n in vc if n.lower() not in shipped]
+        if missing:
+            fail(f"jre/bin 里缺少 {os.path.basename(native)} 依赖的 VC 运行库: {missing}")
+        if vc:
+            print(f"[test] VC 运行库都在 jre/bin: {', '.join(vc)}")
+
+
+def loaded_from_log(log, name):
+    with open(log, encoding="utf-8", errors="replace") as f:
+        return [l.strip() for l in f if "Loaded library" in l and name in l]
 
 
 def main():
@@ -130,16 +140,24 @@ def main():
     java = os.path.join(root, *JAVA[target])
     native_dir = os.path.join(root, "native")
     native = os.path.join(native_dir, NATIVE[target])
+    sqlite_native = os.path.join(native_dir, SQLITE_NATIVE[target])
+    jvm_args = version.get("jvmArgs", [])
+    if not isinstance(jvm_args, list) or not all(isinstance(x, str) for x in jvm_args):
+        fail(f"VERSION.json 的 jvmArgs 应为字符串数组: {jvm_args!r}")
+    extra = [x.replace("${native}", native_dir).replace("${root}", root) for x in jvm_args]
     with open(os.path.join(root, "classpath.txt"), encoding="utf-8") as f:
         jars = [l.strip() for l in f if l.strip()]
     cp = os.pathsep.join(os.path.join(root, "lib", j) for j in jars)
-    base = [java, "--enable-native-access=ALL-UNNAMED"]
-    lib_path = f"-Djava.library.path={native_dir}"
+    bare = [java, "--enable-native-access=ALL-UNNAMED"]
+    host = [*bare, f"-Djava.library.path={native_dir}", *extra]  # 与主机相同：固定参数之后是 jvmArgs，再是 -cp
     print(f"[test] {json.dumps(version)}; {len(jars)} jars", flush=True)
+    natives = sorted(os.path.join(native_dir, n) for n in os.listdir(native_dir))
+    if natives != sorted([native, sqlite_native]):
+        fail(f"native/ 里应只有 {NATIVE[target]} 和 {SQLITE_NATIVE[target]}: {os.listdir(native_dir)}")
     if target == "darwin-arm64":
-        check_macos_binaries(root, native)
+        check_macos_binaries(root, natives)
     else:
-        check_windows_binaries(root, native)
+        check_windows_binaries(root, natives, native)
 
     code, out, err = run([java, "-version"])
     print(err.strip())
@@ -147,46 +165,58 @@ def main():
         fail("java -version")
 
     # 1. signal-cli --version
-    code, out, err = run([*base, lib_path, "-cp", cp, "org.asamk.signal.Main", "--version"])
+    code, out, err = run([*host, "-cp", cp, "org.asamk.signal.Main", "--version"])
     print(f"[test] --version: {out.strip()}")
     if code != 0 or out.strip() != f"signal-cli {version['signalCli']}":
         fail(f"signal-cli --version（exit {code}）: {out}{err}")
 
-    # 2. libsignal 只能从 java.library.path 加载
     smoke_cp = os.pathsep.join([classes, cp])
-    code, out, err = run([*base, "-cp", smoke_cp, "Smoke"])
-    if code == 0 or "signal_jni" not in out + err:
-        fail(f"不给 java.library.path 时 libsignal 不应能加载（exit {code}）: {out}{err}")
-    print("[test] 不给 java.library.path：libsignal 加载失败（符合预期，jar 里没有原生库）")
     tmp = tempfile.mkdtemp(prefix="signal-runtime-test-")
     try:
+        # 2. libsignal 只能从 java.library.path 加载
+        code, out, err = run([*bare, "-cp", smoke_cp, "Smoke"], cwd=tmp)
+        if code == 0 or "signal_jni" not in out + err:
+            fail(f"不给 java.library.path 时 libsignal 不应能加载（exit {code}）: {out}{err}")
+        print("[test] 不给 java.library.path：libsignal 加载失败（符合预期，jar 里没有原生库）")
         # -Xlog 的 file= 不能带盘符里的冒号，所以在临时目录里运行、写相对路径
-        code, out, err = run([*base, lib_path, "-Xlog:library=info:file=library.log", "-cp", smoke_cp, "Smoke"], cwd=tmp)
+        code, out, err = run([*host, "-Xlog:library=info:file=libsignal.log", "-cp", smoke_cp, "Smoke"], cwd=tmp)
         if code != 0:
             fail(f"Smoke（exit {code}）: {out}{err}")
         print(f"[test] {out.strip()}")
-        with open(os.path.join(tmp, "library.log"), encoding="utf-8", errors="replace") as f:
-            loaded = [l.strip() for l in f if "Loaded library" in l and "signal_jni" in l]
+        loaded = loaded_from_log(os.path.join(tmp, "libsignal.log"), "signal_jni")
         print("[test] -Xlog:library: " + " | ".join(loaded))
         if len(loaded) != 1 or os.path.normcase(f"Loaded library {native},") not in os.path.normcase(loaded[0]):
             fail(f"-Xlog:library 里应只有一条从 {native} 加载 libsignal 的记录")
 
-        # 3. sqlite-jdbc
-        code, out, err = run([*base, f"-Djava.io.tmpdir={tmp}", "-cp", smoke_cp, "SqliteSmoke"])
+        # 3. sqlite-jdbc 只从 native/ 加载，不解压到临时目录
+        jtmp = os.path.join(tmp, "java-tmp")
+        os.makedirs(jtmp)
+        code, out, err = run([*bare, f"-Djava.io.tmpdir={jtmp}", "-cp", smoke_cp, "SqliteSmoke"], cwd=tmp)
+        if code == 0 or "NativeLibraryNotFoundException" not in out + err:
+            fail(f"不给 jvmArgs 时 sqlite-jdbc 不应能加载原生库（exit {code}）: {out}{err}")
+        print("[test] 不给 jvmArgs：sqlite-jdbc 加载失败（符合预期，jar 里没有原生库）")
+        code, out, err = run([*host, f"-Djava.io.tmpdir={jtmp}", "-Xlog:library=info:file=sqlite.log", "-cp", smoke_cp, "SqliteSmoke"],
+                             cwd=tmp)
         if code != 0:
             fail(f"SqliteSmoke（exit {code}）: {out}{err}")
         print(f"[test] {out.strip()}")
+        loaded = loaded_from_log(os.path.join(tmp, "sqlite.log"), "sqlitejdbc")
+        print("[test] -Xlog:library: " + " | ".join(loaded))
+        if len(loaded) != 1 or os.path.normcase(f"Loaded library {sqlite_native},") not in os.path.normcase(loaded[0]):
+            fail(f"-Xlog:library 里应只有一条从 {sqlite_native} 加载 sqlite-jdbc 的记录")
+        if os.listdir(jtmp):
+            fail(f"sqlite-jdbc 往临时目录解压了文件: {os.listdir(jtmp)}")
 
         # 4. 多账号 jsonRpc 下 startLink
         if not a.no_link:
-            start_link(base, lib_path, cp, os.path.join(tmp, "data"))
+            start_link(host, cp, os.path.join(tmp, "data"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("[test] 全部通过")
 
 
-def start_link(base, lib_path, cp, data_dir):
-    cmd = [*base, lib_path, "-cp", cp, "org.asamk.signal.Main", "--data-dir", data_dir, "jsonRpc"]
+def start_link(host, cp, data_dir):
+    cmd = [*host, "-cp", cp, "org.asamk.signal.Main", "--data-dir", data_dir, "jsonRpc"]
     started = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             encoding="utf-8", errors="replace")

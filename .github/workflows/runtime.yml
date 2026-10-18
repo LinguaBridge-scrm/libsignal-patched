@@ -2,9 +2,9 @@
 # 为 win32-x64、darwin-arm64 各出一个 signal-runtime-<版本>-<target>.tar.gz（包内布局见 scripts/assemble_runtime.py）。
 # 原生库和补丁版 jar 取自 build.yml 某次成功运行的构件（输入 natives_run；留空 = main 上最近一次成功的运行，
 # 构件保留 90 天，过期了先重跑 build.yml），并核对那次运行用的补丁与本提交的 patches/ 相同。
-# 组装后在对应系统的机器上实测（scripts/test_runtime.py）：Mach-O 只有 arm64、Windows 原生库依赖的 VC 运行库在 jre/bin、
-# signal-cli --version、libsignal 只从 java.library.path 加载 native/ 里的文件、sqlite-jdbc、多账号 jsonRpc 下 startLink 拿到
-# sgnl:// 链接（不扫码）。
+# 组装后在对应系统的机器上实测（scripts/test_runtime.py），启动方式与 NexaChat 主机相同（java.library.path=native 加 VERSION.json
+# 的 jvmArgs）：Mach-O 只有 arm64、Windows 原生库依赖的 VC 运行库在 jre/bin、signal-cli --version、libsignal 和 sqlite-jdbc 都只从
+# native/ 加载（jar 里没有原生库，也不解压到临时目录）、多账号 jsonRpc 下 startLink 拿到 sgnl:// 链接（不扫码）。
 # 勾选 release 时把两个 tar.gz 和 SHA256SUMS 发到 Release signal-runtime-<版本>；同名 Release 已存在就失败，发过的包不覆盖。
 # 换 signal-cli、libsignal、JRE 或原生库时先改 RUNTIME_VERSION（<signal-cli 版本>-<序号>）。
 name: Signal runtime
@@ -38,7 +38,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUNTIME_VERSION: 0.14.9-1
+  RUNTIME_VERSION: 0.14.9-2
   SIGNAL_CLI_VERSION: 0.14.9
   SIGNAL_CLI_SHA256: c32b87f587198cbd277c9d71228716ee6047ee2b63e8e88728e8280d9407d65a
   SIGNAL_CLI_COMMIT: 3997429779095ff3a2d64c877126e84fce9852aa
