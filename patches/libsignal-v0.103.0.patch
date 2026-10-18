@@ -1,0 +1,36 @@
+diff --git a/rust/net/infra/src/route/proxy.rs b/rust/net/infra/src/route/proxy.rs
+index 5a09b0f..907ab13 100644
+--- a/rust/net/infra/src/route/proxy.rs
++++ b/rust/net/infra/src/route/proxy.rs
+@@ -297,7 +297,8 @@ impl ConnectionProxyConfig {
+                 protocol: socks::Protocol::Socks5 {
+                     username_password: auth.map(|auth| (auth.username, auth.password)),
+                 },
+-                resolve_hostname_locally: scheme != "socks5h",
++                // NexaChat: let the proxy resolve hostnames, so no DNS query leaves this machine.
++                resolve_hostname_locally: false,
+             }
+             .into(),
+             scheme => {
+diff --git a/rust/net/src/connect_state.rs b/rust/net/src/connect_state.rs
+index 7c21fff..9aa3ebd 100644
+--- a/rust/net/src/connect_state.rs
++++ b/rust/net/src/connect_state.rs
+@@ -905,14 +905,9 @@ pub type PreconnectingFactory<Inner = DefaultConnectorFactory> =
+     libsignal_net_infra::route::PreconnectingFactory<TransportRoute, Inner>;
+ 
+ pub fn infer_proxy_mode_for_config(config: ConnectionProxyConfig) -> DirectOrProxyMode {
+-    if config.is_signal_transparent_proxy() {
+-        // This was configured in the app, we should take it as a requirement.
+-        DirectOrProxyMode::ProxyOnly(config)
+-    } else {
+-        // This was set at the system level or provided as an environment variable, it may not have
+-        // been intended to apply to Signal.
+-        DirectOrProxyMode::ProxyThenDirect(config)
+-    }
++    // NexaChat: every proxy is configured per account by the app, so it is a requirement;
++    // never fall back to a direct connection.
++    DirectOrProxyMode::ProxyOnly(config)
+ }
+ 
+ #[cfg(test)]

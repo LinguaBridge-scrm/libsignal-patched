@@ -1,0 +1,239 @@
+# 补丁版 libsignal：编译 signal-cli 0.14.9 所用的 libsignal v0.103.0 JNI 原生库，换进 libsignal-client-0.103.0.jar。
+# 补丁（patches/）只改网络层两处：所有代理都按 ProxyOnly 处理（代理断开或变慢时不回退直连）；
+# socks5 一律交给代理解析域名（本机不发 DNS 查询）。
+# 编译方式与官方 .github/workflows/jni_artifacts.yml 相同：java/build_jni.sh desktop（RUSTFLAGS、thin LTO、
+# 日志级别、行号表都由脚本设置），工具链版本取 libsignal 的 rust-toolchain。
+# Linux 用 ubuntu-22.04（glibc 2.35），与官方 Linux 构建镜像 ubuntu:jammy 一致；macos-15 标准机是 Apple Silicon。
+# 构件：native-<平台>（单个原生库 + 构建环境）；libsignal-client-<版本>-patched（换好原生库的 jar、校验值、补丁）。
+# 最后在三个平台上各用替换后的 jar 跑一次冒烟测试（scripts/Smoke.java）。
+name: libsignal (patched)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - patches/**
+      - scripts/**
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIBSIGNAL_VERSION: 0.103.0
+  LIBSIGNAL_COMMIT: ba133bd3457f556fbf56db0a5ab985de0af79da6
+  PATCH_FILE: patches/libsignal-v0.103.0.patch
+  SIGNAL_CLI_VERSION: 0.14.9
+  SIGNAL_CLI_SHA256: c32b87f587198cbd277c9d71228716ee6047ee2b63e8e88728e8280d9407d65a
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-2025
+            lib: signal_jni_amd64.dll
+          - platform: macos-arm64
+            os: macos-15
+            lib: libsignal_jni_aarch64.dylib
+          - platform: linux-x64
+            os: ubuntu-22.04
+            lib: libsignal_jni_amd64.so
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows 上 bash 脚本和补丁都必须保持 LF
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 取 libsignal v${{ env.LIBSIGNAL_VERSION }} 并打补丁
+        run: |
+          git clone --quiet --depth 1 --branch "v$LIBSIGNAL_VERSION" https://github.com/signalapp/libsignal.git libsignal
+          cd libsignal
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$LIBSIGNAL_COMMIT" ]; then
+            echo "::error::标签 v$LIBSIGNAL_VERSION 现在指向 $head，不是预期的 $LIBSIGNAL_COMMIT"
+            exit 1
+          fi
+          git apply --verbose "../$PATCH_FILE"
+          git diff
+
+      - name: Rust 工具链
+        working-directory: libsignal
+        run: |
+          rustup toolchain install "$(cat rust-toolchain)" --profile minimal
+          rustc -vV
+
+      - name: 依赖（nasm、protoc）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm protoc --no-progress -y
+          if (Test-Path 'C:\Program Files\NASM') { 'C:\Program Files\NASM' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH }
+
+      - name: 依赖（protoc）
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install protobuf
+
+      - name: 依赖（clang、protoc）
+        if: runner.os == 'Linux'
+        working-directory: libsignal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev
+          ./bin/install_protoc_linux
+
+      - name: 编译（java/build_jni.sh desktop）
+        working-directory: libsignal
+        run: java/build_jni.sh desktop
+
+      - name: 收集
+        run: |
+          mkdir out
+          cp "libsignal/java/client/src/main/resources/${{ matrix.lib }}" out/
+          {
+            echo "[${{ matrix.platform }}] ${{ matrix.lib }}"
+            echo "runner: ${{ matrix.os }} ${ImageOS:-} ${ImageVersion:-}"
+            (cd libsignal && rustc -V && cargo -V)
+            protoc --version
+            cmake --version | head -n 1
+            echo
+          } > "out/build-info-${{ matrix.platform }}.txt"
+          ls -l out
+          cat "out/build-info-${{ matrix.platform }}.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
+
+  jar:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: natives
+          merge-multiple: true
+
+      - name: 取 signal-cli ${{ env.SIGNAL_CLI_VERSION }} 自带的原版 jar
+        run: |
+          curl -fsSL --retry 3 -o signal-cli.tar.gz \
+            "https://github.com/AsamK/signal-cli/releases/download/v$SIGNAL_CLI_VERSION/signal-cli-$SIGNAL_CLI_VERSION.tar.gz"
+          echo "$SIGNAL_CLI_SHA256  signal-cli.tar.gz" | sha256sum -c -
+          tar -xzf signal-cli.tar.gz --strip-components=2 "signal-cli-$SIGNAL_CLI_VERSION/lib/libsignal-client-$LIBSIGNAL_VERSION.jar"
+
+      - name: 换进补丁版原生库
+        run: python3 scripts/repack_jar.py "libsignal-client-$LIBSIGNAL_VERSION.jar" natives dist
+
+      - name: 校验值与构建信息
+        run: |
+          cp "$PATCH_FILE" dist/
+          {
+            echo "libsignal v$LIBSIGNAL_VERSION ($LIBSIGNAL_COMMIT) + $PATCH_FILE"
+            echo "patch sha256: $(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+            echo "signal-cli-$SIGNAL_CLI_VERSION.tar.gz sha256: $SIGNAL_CLI_SHA256"
+            echo "original libsignal-client-$LIBSIGNAL_VERSION.jar sha256: $(sha256sum "libsignal-client-$LIBSIGNAL_VERSION.jar" | cut -d' ' -f1)"
+            echo "workflow: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (commit $GITHUB_SHA)"
+            echo
+            echo "native libraries (sha256):"
+            (cd natives && sha256sum ./*.dll ./*.dylib ./*.so | sed 's|\./||')
+            echo
+            cat natives/build-info-*.txt
+          } > dist/BUILD-INFO.txt
+          (cd dist && find . -type f | sed 's|^\./||' | sort | xargs sha256sum > SHA256SUMS)
+          {
+            echo '```'
+            cat dist/BUILD-INFO.txt
+            echo
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat dist/BUILD-INFO.txt dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libsignal-client-${{ env.LIBSIGNAL_VERSION }}-patched
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: smoke ${{ matrix.platform }}
+    needs: jar
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-2025
+          - platform: macos-arm64
+            os: macos-15
+          - platform: linux-x64
+            os: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: libsignal-client-${{ env.LIBSIGNAL_VERSION }}-patched
+          path: dist
+
+      - name: 取 signal-cli ${{ env.SIGNAL_CLI_VERSION }}
+        run: |
+          curl -fsSL --retry 3 -o signal-cli.tar.gz \
+            "https://github.com/AsamK/signal-cli/releases/download/v$SIGNAL_CLI_VERSION/signal-cli-$SIGNAL_CLI_VERSION.tar.gz"
+          if command -v sha256sum >/dev/null; then sum=$(sha256sum signal-cli.tar.gz); else sum=$(shasum -a 256 signal-cli.tar.gz); fi
+          if [ "${sum%% *}" != "$SIGNAL_CLI_SHA256" ]; then
+            echo "::error::signal-cli-$SIGNAL_CLI_VERSION.tar.gz 校验值不对：${sum%% *}"
+            exit 1
+          fi
+          tar -xzf signal-cli.tar.gz
+
+      - name: 换上补丁版 jar 并加载原生库（全平台 jar、本平台精简 jar 各一次）
+        run: |
+          jar="libsignal-client-$LIBSIGNAL_VERSION.jar"
+          lib="signal-cli-$SIGNAL_CLI_VERSION/lib"
+          for candidate in "dist/$jar" "dist/${{ matrix.platform }}/$jar"; do
+            echo "== $candidate"
+            cp "$candidate" "$lib/$jar"
+            java --enable-native-access=ALL-UNNAMED -cp "$lib/*" scripts/Smoke.java
+          done
